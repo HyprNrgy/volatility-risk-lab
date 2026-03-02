@@ -1,116 +1,48 @@
 import { NextResponse } from 'next/server';
-import YahooFinance from 'yahoo-finance2';
-import { returns, rollingStd, std, mean, percentile, maxDrawdown, covariance, variance } from '@/lib/math';
-
-const yahooFinance = new YahooFinance();
+import { simulateGBM } from '@/lib/math';
 
 export async function POST(req: Request) {
   try {
     const body = await req.json();
-    const { ticker, startDate, endDate, benchmark = '^GSPC', logReturns = false } = body;
+    const { S0, mu, sigma, days = 252, paths = 10000 } = body;
 
-    if (!ticker || !startDate || !endDate) {
+    if (S0 === undefined || mu === undefined || sigma === undefined) {
       return NextResponse.json({ error: 'Missing required parameters' }, { status: 400 });
     }
 
-    const queryOptions = {
-      period1: startDate,
-      period2: endDate,
-      interval: '1d' as const,
-    };
+    const { finalPrices, maxDrawdowns, samplePaths } = simulateGBM(S0, mu, sigma, days, paths);
 
-    // Fetch asset data
-    let assetData: any[];
-    try {
-      assetData = await yahooFinance.historical(ticker, queryOptions);
-    } catch (e: any) {
-      if (e.message && e.message.includes('No data found')) {
-        return NextResponse.json({ error: `No data found for ticker ${ticker}. It may be delisted or invalid.` }, { status: 404 });
-      }
-      throw e;
-    }
-
-    // Fetch benchmark data
-    let benchmarkData: any[];
-    try {
-      benchmarkData = await yahooFinance.historical(benchmark, queryOptions);
-    } catch (e: any) {
-      if (e.message && e.message.includes('No data found')) {
-        return NextResponse.json({ error: `No data found for benchmark ${benchmark}. It may be invalid.` }, { status: 404 });
-      }
-      throw e;
-    }
-
-    if (assetData.length === 0) {
-      return NextResponse.json({ error: 'No data found for ticker' }, { status: 404 });
-    }
-
-    // Forward fill logic for missing data (yfinance usually returns clean data, but we implement logic)
-    const dates = assetData.map(d => d.date.toISOString().split('T')[0]);
-    const adjClose = assetData.map(d => d.adjClose || d.close);
+    // Calculate histogram data for final prices
+    const minPrice = Math.min(...finalPrices);
+    const maxPrice = Math.max(...finalPrices);
+    const bins = 50;
+    const binSize = (maxPrice - minPrice) / bins;
     
-    // Align benchmark data
-    const benchMap = new Map(benchmarkData.map(d => [d.date.toISOString().split('T')[0], d.adjClose || d.close]));
-    const benchClose = dates.map(d => benchMap.get(d) || null);
-
-    // Forward fill benchmark
-    let lastBench = benchClose.find(v => v !== null) || 1;
-    for (let i = 0; i < benchClose.length; i++) {
-      if (benchClose[i] === null) {
-        benchClose[i] = lastBench;
-      } else {
-        lastBench = benchClose[i] as number;
-      }
+    const histogram = Array(bins).fill(0);
+    for (const p of finalPrices) {
+      const binIndex = Math.floor((p - minPrice) / binSize);
+      if (binIndex >= bins) histogram[bins - 1]++;
+      else histogram[binIndex]++;
     }
 
-    const assetReturns = returns(adjClose, logReturns);
-    const benchReturns = returns(benchClose as number[], logReturns);
-
-    // Remove first element (0) for accurate metrics
-    const validAssetReturns = assetReturns.slice(1);
-    const validBenchReturns = benchReturns.slice(1);
-
-    const annVol = std(validAssetReturns) * Math.sqrt(252);
-    const mdd = maxDrawdown(adjClose);
-    
-    const assetBenchCov = covariance(validAssetReturns, validBenchReturns);
-    const benchVar = variance(validBenchReturns);
-    const beta = benchVar === 0 ? 0 : assetBenchCov / benchVar;
-
-    const histVaR95 = percentile(validAssetReturns, 5);
-    const mu = mean(validAssetReturns);
-    const sigma = std(validAssetReturns);
-    const paramVaR95 = mu - 1.645 * sigma;
-
-    const roll20 = rollingStd(assetReturns, 20).map(v => isNaN(v) ? null : v * Math.sqrt(252));
-    const roll60 = rollingStd(assetReturns, 60).map(v => isNaN(v) ? null : v * Math.sqrt(252));
-    const roll252 = rollingStd(assetReturns, 252).map(v => isNaN(v) ? null : v * Math.sqrt(252));
-
-    const chartData = dates.map((date, i) => ({
-      date,
-      price: adjClose[i],
-      return: assetReturns[i],
-      vol20: roll20[i],
-      vol60: roll60[i],
-      vol252: roll252[i],
+    const histogramData = histogram.map((count, i) => ({
+      bin: minPrice + i * binSize + binSize / 2,
+      count
     }));
 
+    const expectedDrawdown = maxDrawdowns.reduce((a, b) => a + b, 0) / paths;
+    const expectedReturn = (finalPrices.reduce((a, b) => a + b, 0) / paths) / S0 - 1;
+
     return NextResponse.json({
-      metrics: {
-        annualizedVolatility: annVol,
-        maxDrawdown: mdd,
-        beta,
-        historicalVaR95: histVaR95,
-        parametricVaR95: paramVaR95,
-        meanReturn: mu * 252, // Annualized
-      },
-      chartData,
-      auditLog: [
-        `Fetched ${assetData.length} records for ${ticker}`,
-        `Forward filled ${benchClose.filter(v => v === null).length} missing benchmark records`,
-        `Calculated metrics using ${logReturns ? 'log' : 'simple'} returns`,
-      ],
-      warnings: assetData.length < 252 ? ['Insufficient data window for 252-day rolling volatility'] : []
+      histogramData,
+      samplePaths,
+      expectedDrawdown,
+      expectedReturn,
+      finalPricesSummary: {
+        min: minPrice,
+        max: maxPrice,
+        mean: finalPrices.reduce((a, b) => a + b, 0) / paths
+      }
     });
 
   } catch (error: any) {
