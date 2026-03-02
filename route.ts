@@ -1,168 +1,143 @@
 import { NextResponse } from 'next/server';
 import YahooFinance from 'yahoo-finance2';
-import { returns, std, mean, covariance, correlation, matrixMult, transpose } from '@/lib/math';
 
 const yahooFinance = new YahooFinance();
 
 export async function POST(req: Request) {
   try {
     const body = await req.json();
-    const { tickers, weights, startDate, endDate, riskFreeRateSource = '^TNX' } = body;
+    const { tickers, weights, benchmark = 'SPY', shock = -0.10 } = body;
 
     if (!tickers || !weights || tickers.length !== weights.length) {
-      return NextResponse.json({ error: 'Invalid tickers or weights' }, { status: 400 });
+      return NextResponse.json({ error: 'Invalid input' }, { status: 400 });
     }
 
-    const sumWeights = weights.reduce((a: number, b: number) => a + b, 0);
-    if (Math.abs(sumWeights - 1) > 0.001) {
-      return NextResponse.json({ error: 'Weights must sum to 1' }, { status: 400 });
-    }
+    const endDate = new Date();
+    const startDate = new Date();
+    startDate.setFullYear(endDate.getFullYear() - 5); // 5 years of data for beta
 
     const queryOptions = {
-      period1: startDate,
-      period2: endDate,
+      period1: startDate.toISOString().split('T')[0],
+      period2: endDate.toISOString().split('T')[0],
       interval: '1d' as const,
     };
 
-    const assetDataPromises = tickers.map(async (t: string) => {
-      try {
-        return await yahooFinance.historical(t, queryOptions);
-      } catch (e: any) {
-        if (e.message && e.message.includes('No data found')) {
-          throw new Error(`No data found for ticker ${t}. It may be delisted or invalid.`);
-        }
-        throw e;
-      }
-    });
-    const assetDataResults: any[][] = await Promise.all(assetDataPromises);
-    
-    // Fetch risk-free rate
-    let riskFreeRate = 0.04; // Default 4%
+    // Fetch benchmark data
+    let benchData: any[] = [];
     try {
-      const rfrData: any = await yahooFinance.quote(riskFreeRateSource);
-      if (rfrData && rfrData.regularMarketPrice) {
-        riskFreeRate = rfrData.regularMarketPrice / 100;
-      }
-    } catch (e) {
-      console.warn('Could not fetch risk-free rate, using default 4%');
+      benchData = await yahooFinance.historical(benchmark, queryOptions);
+    } catch (e: any) {
+      return NextResponse.json({ error: `Failed to fetch benchmark data for ${benchmark}: ${e.message}` }, { status: 400 });
     }
 
-    // Align dates based on the first ticker
-    const dates = assetDataResults[0].map(d => d.date.toISOString().split('T')[0]);
-    
-    const allReturns: number[][] = [];
-    const annVols: number[] = [];
-    const annMeans: number[] = [];
+    if (!benchData || benchData.length < 2) {
+      return NextResponse.json({ error: `Insufficient benchmark data for ${benchmark}` }, { status: 400 });
+    }
+
+    // Calculate daily returns for benchmark
+    const benchReturns: { date: string; ret: number }[] = [];
+    for (let i = 1; i < benchData.length; i++) {
+      const ret = (benchData[i].adjClose - benchData[i - 1].adjClose) / benchData[i - 1].adjClose;
+      benchReturns.push({ date: benchData[i].date.toISOString().split('T')[0], ret });
+    }
+
+    const benchVariance = benchReturns.reduce((sum, r) => sum + Math.pow(r.ret, 2), 0) / benchReturns.length;
+
+    const assetResults = [];
+    let portfolioExpectedImpact = 0;
+
+    // Historical scenarios
+    const scenarios = [
+      { name: 'COVID-19 Crash', start: '2020-02-19', end: '2020-03-23' },
+      { name: '2022 Bear Market', start: '2022-01-03', end: '2022-10-12' },
+    ];
+
+    const scenarioResults = scenarios.map(s => ({ name: s.name, portfolioReturn: 0, valid: true }));
 
     for (let i = 0; i < tickers.length; i++) {
-      const data = assetDataResults[i];
-      const dataMap = new Map(data.map(d => [d.date.toISOString().split('T')[0], d.adjClose || d.close]));
-      
-      let lastPrice = dataMap.get(dates[0]) || 1;
-      const prices = dates.map(d => {
-        const p = dataMap.get(d);
-        if (p !== undefined) {
-          lastPrice = p;
-          return p;
-        }
-        return lastPrice;
-      });
+      const ticker = tickers[i];
+      const weight = weights[i];
 
-      const ret = returns(prices, false).slice(1);
-      allReturns.push(ret);
-      annVols.push(std(ret) * Math.sqrt(252));
-      annMeans.push(mean(ret) * 252);
-    }
-
-    const n = tickers.length;
-    const covMatrix: number[][] = Array(n).fill(0).map(() => Array(n).fill(0));
-    const corMatrix: number[][] = Array(n).fill(0).map(() => Array(n).fill(0));
-
-    for (let i = 0; i < n; i++) {
-      for (let j = 0; j < n; j++) {
-        covMatrix[i][j] = covariance(allReturns[i], allReturns[j]) * 252; // Annualized covariance
-        corMatrix[i][j] = correlation(allReturns[i], allReturns[j]);
+      let assetData: any[] = [];
+      try {
+        assetData = await yahooFinance.historical(ticker, queryOptions);
+      } catch (e: any) {
+        throw new Error(`Failed to fetch data for ${ticker}: ${e.message}`);
       }
-    }
 
-    // Portfolio Variance: w^T * Cov * w
-    const wMatrix = [weights]; // 1 x n
-    const wTMatrix = transpose(wMatrix); // n x 1
-    const covW = matrixMult(covMatrix, wTMatrix); // n x 1
-    const portVarMatrix = matrixMult(wMatrix, covW); // 1 x 1
-    const portVar = portVarMatrix[0][0];
-    const portVol = Math.sqrt(portVar);
+      if (!assetData || assetData.length < 2) {
+        throw new Error(`Insufficient data for ${ticker}`);
+      }
 
-    // Marginal Risk Contribution: (Cov * w) / portVol
-    const mrc = covW.map(row => row[0] / portVol);
-    
-    // Percentage Risk Contribution: (w * mrc) / portVol
-    const prc = weights.map((w: number, i: number) => (w * mrc[i]) / portVol);
+      // Align dates and calculate covariance
+      let covSum = 0;
+      let count = 0;
 
-    const portReturn = weights.reduce((sum: number, w: number, i: number) => sum + w * annMeans[i], 0);
-    const sharpeRatio = portVol === 0 ? 0 : (portReturn - riskFreeRate) / portVol;
+      const assetMap = new Map(assetData.map(d => [d.date.toISOString().split('T')[0], d.adjClose]));
 
-    // Efficient Frontier Simulation (Random Portfolios)
-    const efficientFrontier = [];
-    for (let i = 0; i < 2000; i++) {
-      const rw = Array(n).fill(0).map(() => Math.random());
-      const sumRw = rw.reduce((a, b) => a + b, 0);
-      const normRw = rw.map(w => w / sumRw);
-      
-      const rWMatrix = [normRw];
-      const rWTMatrix = transpose(rWMatrix);
-      const rCovW = matrixMult(covMatrix, rWTMatrix);
-      const rPortVar = matrixMult(rWMatrix, rCovW)[0][0];
-      const rPortVol = Math.sqrt(rPortVar);
-      const rPortRet = normRw.reduce((sum, w, idx) => sum + w * annMeans[idx], 0);
-      
-      efficientFrontier.push({
-        volatility: rPortVol,
-        return: rPortRet,
-        sharpe: (rPortRet - riskFreeRate) / rPortVol,
-        weights: normRw
+      for (let j = 1; j < benchReturns.length; j++) {
+        const date = benchReturns[j].date;
+        const prevDate = benchReturns[j - 1].date;
+
+        if (assetMap.has(date) && assetMap.has(prevDate)) {
+          const currentPrice = assetMap.get(date)!;
+          const prevPrice = assetMap.get(prevDate)!;
+          const assetRet = (currentPrice - prevPrice) / prevPrice;
+          
+          covSum += assetRet * benchReturns[j].ret;
+          count++;
+        }
+      }
+
+      const covariance = count > 0 ? covSum / count : 0;
+      const beta = benchVariance > 0 ? covariance / benchVariance : 1;
+      const expectedImpact = beta * shock;
+
+      portfolioExpectedImpact += weight * expectedImpact;
+
+      assetResults.push({
+        ticker,
+        weight,
+        beta,
+        expectedImpact
       });
-    }
 
-    // Sort by volatility for plotting
-    efficientFrontier.sort((a, b) => a.volatility - b.volatility);
+      // Calculate historical scenario returns
+      for (let sIdx = 0; sIdx < scenarios.length; sIdx++) {
+        const scenario = scenarios[sIdx];
+        // Find closest dates
+        let startPrice = null;
+        let endPrice = null;
 
-    // Extract the upper edge (the actual efficient frontier)
-    const upperEdge = [];
-    let maxRet = -Infinity;
-    for (const pt of efficientFrontier) {
-      if (pt.return > maxRet) {
-        upperEdge.push(pt);
-        maxRet = pt.return;
+        // Find exact or next available date for start
+        const sortedDates = Array.from(assetMap.keys()).sort();
+        const startMatch = sortedDates.find(d => d >= scenario.start);
+        const endMatch = sortedDates.slice().reverse().find(d => d <= scenario.end);
+
+        if (startMatch && endMatch && startMatch < endMatch) {
+          startPrice = assetMap.get(startMatch);
+          endPrice = assetMap.get(endMatch);
+        }
+
+        if (startPrice && endPrice) {
+          const ret = (endPrice - startPrice) / startPrice;
+          scenarioResults[sIdx].portfolioReturn += weight * ret;
+        } else {
+          scenarioResults[sIdx].valid = false; // Missing data for this asset in this period
+        }
       }
     }
 
     return NextResponse.json({
-      individual: tickers.map((t: string, i: number) => ({
-        ticker: t,
-        annualizedVolatility: annVols[i],
-        annualizedReturn: annMeans[i],
-        weight: weights[i],
-        marginalRiskContribution: mrc[i],
-        percentageRiskContribution: prc[i]
-      })),
-      portfolio: {
-        variance: portVar,
-        volatility: portVol,
-        expectedReturn: portReturn,
-        sharpeRatio,
-        riskFreeRate
-      },
-      matrices: {
-        covariance: covMatrix,
-        correlation: corMatrix
-      },
-      efficientFrontier: upperEdge,
-      scatterPoints: efficientFrontier.filter((_, i) => i % 10 === 0) // Downsample for scatter plot
+      benchmark,
+      shock,
+      portfolioExpectedImpact,
+      assetResults,
+      historicalScenarios: scenarioResults.filter(s => s.valid)
     });
 
   } catch (error: any) {
-    console.error(error);
-    return NextResponse.json({ error: error.message || 'Internal server error' }, { status: 500 });
+    console.error('Scenario API Error:', error);
+    return NextResponse.json({ error: error.message || 'Failed to process scenario analysis' }, { status: 500 });
   }
 }
