@@ -18,7 +18,7 @@ export async function POST(req: Request) {
     
     const data = quotes.map((q) => {
       // Create a deterministic hash for sector assignment
-      const charCodeSum = q.symbol.split('').reduce((sum, char) => sum + char.charCodeAt(0), 0);
+      const charCodeSum = q.symbol.split('').reduce((sum: number, char: string) => sum + char.charCodeAt(0), 0);
       const sector = sectors[charCodeSum % sectors.length];
       
       return {
